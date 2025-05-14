@@ -6,6 +6,7 @@ const helmet = require('helmet');
 const fetch = require('node-fetch');
 const { ETH_BSC_QUERY, BITCOIN_QUERY, SOLANA_QUERY } = require('./bitquery-templates');
 const { createClient } = require('@supabase/supabase-js');
+const { sendAlertEmail } = require('./email');
 
 // Setup Supabase client
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -34,6 +35,10 @@ let whaleCache = {
   SOL: []
 };
 
+// In-memory set to prevent duplicate alerts (cleared every 6 hours)
+const alertedTxs = new Set();
+setInterval(() => alertedTxs.clear(), 6 * 60 * 60 * 1000); // clear every 6 hours
+
 // Example: Dummy data for demonstration
 whaleCache.ETH = [
   {
@@ -56,11 +61,51 @@ whaleCache.BTC = [
   }
 ];
 
+// Helper: get all subscribers from Supabase
+async function getSubscribers() {
+  const { data, error } = await supabase.from('subscriptions').select('email, threshold');
+  if (error) {
+    console.error('Error fetching subscribers:', error.message);
+    return [];
+  }
+  return data || [];
+}
+
+// Helper: process and alert for new transactions
+async function processAndAlert(chain, txs) {
+  if (!txs.length) return;
+  const subscribers = await getSubscribers();
+  for (const tx of txs) {
+    // Compose a unique key for deduplication
+    const txKey = `${chain}:${tx.txHash || tx.signature || tx.hash}`;
+    if (alertedTxs.has(txKey)) continue;
+    for (const sub of subscribers) {
+      if (Number(tx.amount) >= Number(sub.threshold)) {
+        try {
+          await sendAlertEmail(sub.email, {
+            chain,
+            amount: tx.amount,
+            sender: tx.sender?.address || tx.address || '',
+            receiver: tx.receiver?.address || '',
+            timestamp: tx.block?.timestamp?.time || tx.timestamp || '',
+            txHash: tx.txHash || tx.signature || tx.hash || ''
+          });
+          console.log(`Alert sent to ${sub.email} for ${chain} tx ${txKey}`);
+        } catch (err) {
+          console.error(`Failed to send alert to ${sub.email}:`, err.message);
+        }
+      }
+    }
+    alertedTxs.add(txKey);
+  }
+}
+
+// Update polling functions to call processAndAlert and update whaleCache
 async function fetchEthOrBsc(network) {
   const since = lastSeen[network] || new Date(Date.now() - 10 * 60 * 1000).toISOString();
   const variables = {
     network,
-    minAmount: 0.1, // Example threshold for demo
+    minAmount: 100, // Production threshold for whale alerts
     since,
   };
   const res = await fetch(ENDPOINT, {
@@ -75,6 +120,15 @@ async function fetchEthOrBsc(network) {
   const txs = data.data?.ethereum?.transfers || [];
   if (txs.length > 0) {
     lastSeen[network] = txs[0].block.timestamp.time;
+    whaleCache[network.toUpperCase()] = txs.map(tx => ({
+      chain: network.toUpperCase(),
+      amount: tx.amount,
+      sender: tx.sender?.address,
+      receiver: tx.receiver?.address,
+      timestamp: tx.block?.timestamp?.time,
+      txHash: tx.transaction?.hash
+    }));
+    await processAndAlert(network.toUpperCase(), whaleCache[network.toUpperCase()]);
     console.log(`\n[${network.toUpperCase()}] New transfers:`);
     txs.forEach(tx => console.log(tx));
   }
@@ -83,7 +137,7 @@ async function fetchEthOrBsc(network) {
 async function fetchSolana() {
   const since = lastSeen.solana || new Date(Date.now() - 10 * 60 * 1000).toISOString();
   const variables = {
-    minAmount: 1, // Example threshold
+    minAmount: 1000, // Production threshold for whale alerts
     since,
   };
   const res = await fetch(ENDPOINT, {
@@ -98,6 +152,15 @@ async function fetchSolana() {
   const txs = data.data?.solana?.transfers || [];
   if (txs.length > 0) {
     lastSeen.solana = txs[0].block.timestamp.time;
+    whaleCache.SOL = txs.map(tx => ({
+      chain: 'SOL',
+      amount: tx.amount,
+      sender: tx.sender?.address,
+      receiver: tx.receiver?.address,
+      timestamp: tx.block?.timestamp?.time,
+      txHash: tx.transaction?.signature
+    }));
+    await processAndAlert('SOL', whaleCache.SOL);
     console.log(`\n[SOLANA] New transfers:`);
     txs.forEach(tx => console.log(tx));
   }
@@ -115,12 +178,21 @@ async function fetchBitcoin() {
     body: JSON.stringify({ query: BITCOIN_QUERY, variables }),
   });
   const data = await res.json();
-  const minAmount = 0.01; // Example threshold
+  const minAmount = 10; // Production threshold for whale alerts
   const outputs = data.data?.bitcoin?.outputs || [];
   // Filter by value in code
   const filtered = outputs.filter(o => o.value > minAmount);
   if (filtered.length > 0) {
     lastSeen.bitcoin = filtered[0].block.timestamp.time;
+    whaleCache.BTC = filtered.map(tx => ({
+      chain: 'BTC',
+      amount: tx.value,
+      sender: '',
+      receiver: '',
+      timestamp: tx.block?.timestamp?.time,
+      txHash: tx.transaction?.hash
+    }));
+    await processAndAlert('BTC', whaleCache.BTC);
     console.log(`\n[BITCOIN] New outputs:`);
     filtered.forEach(tx => console.log(tx));
   }
@@ -167,6 +239,26 @@ app.post('/subscribe', async (req, res) => {
     return res.status(500).json({ error: 'Database error', details: error.message, supabase: error });
   }
   res.json({ success: true });
+});
+
+// Test route to send a sample alert email
+app.post('/test-email', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  const fakeTx = {
+    chain: 'ETH',
+    amount: 123.45,
+    sender: '0xabc...123',
+    receiver: '0xdef...456',
+    timestamp: new Date().toISOString(),
+    txHash: '0xhash1'
+  };
+  try {
+    await sendAlertEmail(email, fakeTx);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 4000;
