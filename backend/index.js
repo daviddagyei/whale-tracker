@@ -216,9 +216,17 @@ app.get('/transactions', (req, res) => {
   if (chain) {
     allTxs = allTxs.filter(tx => tx.chain === chain);
   }
+  // Deduplicate by chain+txHash
+  const seen = new Set();
+  const deduped = allTxs.filter(tx => {
+    const key = `${tx.chain}:${tx.txHash}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
   // Sort by timestamp descending
-  allTxs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-  res.json(allTxs);
+  deduped.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  res.json(deduped);
 });
 
 // POST /subscribe { email, threshold }
