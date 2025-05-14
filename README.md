@@ -1,4 +1,4 @@
-# Whale Transaction Monitor
+# Whale Tracker
 
 ## Project Setup
 
