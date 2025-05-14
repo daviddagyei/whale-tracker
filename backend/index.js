@@ -39,27 +39,15 @@ let whaleCache = {
 const alertedTxs = new Set();
 setInterval(() => alertedTxs.clear(), 6 * 60 * 60 * 1000); // clear every 6 hours
 
-// Example: Dummy data for demonstration
-whaleCache.ETH = [
-  {
-    chain: 'ETH',
-    amount: 123.45,
-    sender: '0xabc...123',
-    receiver: '0xdef...456',
-    timestamp: new Date().toISOString(),
-    txHash: '0xhash1'
-  }
-];
-whaleCache.BTC = [
-  {
-    chain: 'BTC',
-    amount: 10.5,
-    sender: '1A1zP1...',
-    receiver: '1BvBMSE...',
-    timestamp: new Date().toISOString(),
-    txHash: '0xhash2'
-  }
-];
+// Helper to convert UTC ISO string to CST (Central Standard Time, UTC-6)
+function toCST(isoString) {
+  const date = new Date(isoString);
+  // CST is UTC-6, but for daylight saving, you may want CDT (UTC-5)
+  // Here we use UTC-6 always for simplicity
+  const utc = date.getTime() + (date.getTimezoneOffset() * 60000);
+  const cst = new Date(utc - (6 * 60 * 60 * 1000));
+  return cst.toISOString().replace('T', ' ').replace('Z', ' CST');
+}
 
 // Helper: get all subscribers from Supabase
 async function getSubscribers() {
@@ -102,10 +90,11 @@ async function processAndAlert(chain, txs) {
 
 // Update polling functions to call processAndAlert and update whaleCache
 async function fetchEthOrBsc(network) {
-  const since = lastSeen[network] || new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  // Always fetch the last 10 minutes (rolling window)
+  const since = new Date(Date.now() - 10 * 60 * 1000).toISOString();
   const variables = {
     network,
-    minAmount: 100, // Production threshold for whale alerts
+    minAmount: network === 'ethereum' ? 100 : 100, // 100 ETH or 100 BNB for production
     since,
   };
   const res = await fetch(ENDPOINT, {
@@ -118,26 +107,32 @@ async function fetchEthOrBsc(network) {
   });
   const data = await res.json();
   const txs = data.data?.ethereum?.transfers || [];
-  if (txs.length > 0) {
-    lastSeen[network] = txs[0].block.timestamp.time;
-    whaleCache[network.toUpperCase()] = txs.map(tx => ({
-      chain: network.toUpperCase(),
-      amount: tx.amount,
-      sender: tx.sender?.address,
-      receiver: tx.receiver?.address,
-      timestamp: tx.block?.timestamp?.time,
-      txHash: tx.transaction?.hash
-    }));
-    await processAndAlert(network.toUpperCase(), whaleCache[network.toUpperCase()]);
-    console.log(`\n[${network.toUpperCase()}] New transfers:`);
-    txs.forEach(tx => console.log(tx));
-  }
+  // Deduplicate by txHash (in-memory set)
+  const seen = new Set();
+  const deduped = txs.filter(tx => {
+    const key = tx.transaction?.hash;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  whaleCache[network.toUpperCase()] = deduped.map(tx => ({
+    chain: network.toUpperCase(),
+    amount: tx.amount,
+    sender: tx.sender?.address,
+    receiver: tx.receiver?.address,
+    timestamp: toCST(tx.block?.timestamp?.time),
+    txHash: tx.transaction?.hash
+  }));
+  await processAndAlert(network.toUpperCase(), whaleCache[network.toUpperCase()]);
+  console.log(`\n[${network.toUpperCase()}] New transfers:`);
+  deduped.forEach(tx => console.log(tx));
 }
 
 async function fetchSolana() {
-  const since = lastSeen.solana || new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  // Always fetch the last 10 minutes (rolling window)
+  const since = new Date(Date.now() - 10 * 60 * 1000).toISOString();
   const variables = {
-    minAmount: 1000, // Production threshold for whale alerts
+    minAmount: 10000, // 10,000 SOL for production
     since,
   };
   const res = await fetch(ENDPOINT, {
@@ -150,24 +145,30 @@ async function fetchSolana() {
   });
   const data = await res.json();
   const txs = data.data?.solana?.transfers || [];
-  if (txs.length > 0) {
-    lastSeen.solana = txs[0].block.timestamp.time;
-    whaleCache.SOL = txs.map(tx => ({
-      chain: 'SOL',
-      amount: tx.amount,
-      sender: tx.sender?.address,
-      receiver: tx.receiver?.address,
-      timestamp: tx.block?.timestamp?.time,
-      txHash: tx.transaction?.signature
-    }));
-    await processAndAlert('SOL', whaleCache.SOL);
-    console.log(`\n[SOLANA] New transfers:`);
-    txs.forEach(tx => console.log(tx));
-  }
+  // Deduplicate by signature
+  const seen = new Set();
+  const deduped = txs.filter(tx => {
+    const key = tx.transaction?.signature;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  whaleCache.SOL = deduped.map(tx => ({
+    chain: 'SOL',
+    amount: tx.amount,
+    sender: tx.sender?.address,
+    receiver: tx.receiver?.address,
+    timestamp: toCST(tx.block?.timestamp?.time),
+    txHash: tx.transaction?.signature
+  }));
+  await processAndAlert('SOL', whaleCache.SOL);
+  console.log(`\n[SOLANA] New transfers:`);
+  deduped.forEach(tx => console.log(tx));
 }
 
 async function fetchBitcoin() {
-  const since = lastSeen.bitcoin || new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  // Always fetch the last 10 minutes (rolling window)
+  const since = new Date(Date.now() - 10 * 60 * 1000).toISOString();
   const variables = { since };
   const res = await fetch(ENDPOINT, {
     method: 'POST',
@@ -178,24 +179,22 @@ async function fetchBitcoin() {
     body: JSON.stringify({ query: BITCOIN_QUERY, variables }),
   });
   const data = await res.json();
-  const minAmount = 10; // Production threshold for whale alerts
+  const minAmount = 100; // 100 BTC for production
   const outputs = data.data?.bitcoin?.outputs || [];
-  // Filter by value in code
-  const filtered = outputs.filter(o => o.value > minAmount);
-  if (filtered.length > 0) {
-    lastSeen.bitcoin = filtered[0].block.timestamp.time;
-    whaleCache.BTC = filtered.map(tx => ({
-      chain: 'BTC',
-      amount: tx.value,
-      sender: '',
-      receiver: '',
-      timestamp: tx.block?.timestamp?.time,
-      txHash: tx.transaction?.hash
-    }));
-    await processAndAlert('BTC', whaleCache.BTC);
-    console.log(`\n[BITCOIN] New outputs:`);
-    filtered.forEach(tx => console.log(tx));
-  }
+  // Filter by value in code and deduplicate by tx hash
+  const seen = new Set();
+  const filtered = outputs.filter(o => o.value > minAmount && !seen.has(o.transaction?.hash) && seen.add(o.transaction?.hash));
+  whaleCache.BTC = filtered.map(tx => ({
+    chain: 'BTC',
+    amount: tx.value,
+    sender: '',
+    receiver: '',
+    timestamp: toCST(tx.block?.timestamp?.time),
+    txHash: tx.transaction?.hash
+  }));
+  await processAndAlert('BTC', whaleCache.BTC);
+  console.log(`\n[BITCOIN] New outputs:`);
+  filtered.forEach(tx => console.log(tx));
 }
 
 // Polling scheduler
