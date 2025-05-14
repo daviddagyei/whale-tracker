@@ -7,6 +7,7 @@ const fetch = require('node-fetch');
 const { ETH_BSC_QUERY, BITCOIN_QUERY, SOLANA_QUERY } = require('./bitquery-templates');
 const { createClient } = require('@supabase/supabase-js');
 const { sendAlertEmail } = require('./email');
+const { format, toZonedTime } = require('date-fns-tz');
 
 // Setup Supabase client
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -40,13 +41,10 @@ const alertedTxs = new Set();
 setInterval(() => alertedTxs.clear(), 6 * 60 * 60 * 1000); // clear every 6 hours
 
 // Helper to convert UTC ISO string to CST (Central Standard Time, UTC-6)
+// NOTE: For correct frontend relative time, just return the UTC ISO string (with 'Z').
 function toCST(isoString) {
-  const date = new Date(isoString);
-  // CST is UTC-6, but for daylight saving, you may want CDT (UTC-5)
-  // Here we use UTC-6 always for simplicity
-  const utc = date.getTime() + (date.getTimezoneOffset() * 60000);
-  const cst = new Date(utc - (6 * 60 * 60 * 1000));
-  return cst.toISOString().replace('T', ' ').replace('Z', ' CST');
+  if (!isoString) return '';
+  return isoString; // Let frontend handle time zone display/formatting
 }
 
 // Helper: get all subscribers from Supabase
@@ -115,16 +113,17 @@ async function fetchEthOrBsc(network) {
     seen.add(key);
     return true;
   });
-  whaleCache[network.toUpperCase()] = deduped.map(tx => ({
-    chain: network.toUpperCase(),
+  const chainKey = network.toUpperCase() === 'ETHEREUM' ? 'ETH' : network.toUpperCase();
+  whaleCache[chainKey] = deduped.map(tx => ({
+    chain: chainKey,
     amount: tx.amount,
     sender: tx.sender?.address,
     receiver: tx.receiver?.address,
     timestamp: toCST(tx.block?.timestamp?.time),
     txHash: tx.transaction?.hash
-  }));
-  await processAndAlert(network.toUpperCase(), whaleCache[network.toUpperCase()]);
-  console.log(`\n[${network.toUpperCase()}] New transfers:`);
+  })).filter(tx => tx.txHash && tx.amount != null); // Ensure valid txHash and amount
+  await processAndAlert(chainKey, whaleCache[chainKey]);
+  console.log(`\n[${chainKey}] New transfers:`);
   deduped.forEach(tx => console.log(tx));
 }
 
